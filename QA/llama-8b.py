@@ -6,7 +6,7 @@ from prompt import qa_prompt
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
-model_id = "meta-llama/Llama-3.1-8B-Instruct"
+model_id ="Qwen/Qwen2.5-3B-Instruct"
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -34,10 +34,14 @@ def main():
                 processed_sentences.add(data["id"])
 
     # =========================================== Load Dataset ===========================================
-    pipeline_types = ["vanilla", "atomic", "semantic"]
-
+    pipeline_types = ["vanilla"]
+    #pipeline_types = ["vanilla", "atomic", "semantic"]
     for pipeline_type in pipeline_types:
-        with open(f"../QG/llama-8b/{pipeline_type}_llama-8b.jsonl", 'r') as f_in, open(f"{args.output_path}-{pipeline_type}.jsonl", 'a') as f_out:
+        # assicura che la cartella di output esista
+        os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+        with open(f"/content/ASKQE/QG/llama-8b/{pipeline_type}_llama-8b.jsonl", 'r') as f_in, \
+            open(f"{args.output_path}-{pipeline_type}.jsonl", 'a') as f_out:
+
             for line in f_in:
                 data = json.loads(line)
 
@@ -58,17 +62,12 @@ def main():
                             add_generation_prompt=True,
                             return_tensors="pt",
                         ).to(device)
-                    terminators = [
-                            tokenizer.eos_token_id,
-                            tokenizer.convert_tokens_to_ids("<|eot_id|>")
-                        ]
-                    
                     with torch.no_grad():
-                        outputs = model.generate(
-                            input_ids,
-                            max_new_tokens=1024,
-                            eos_token_id=terminators,
-                        )
+                      outputs = model.generate(
+                          input_ids=input_ids,
+                          max_new_tokens=256,
+                          eos_token_id=tokenizer.eos_token_id
+                      )
                     response = outputs[0][input_ids.shape[-1]:]
                     generated_answers = tokenizer.decode(response, skip_special_tokens=True)
 

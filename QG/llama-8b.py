@@ -2,97 +2,128 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import json
 import argparse
-import os
+import sys
+
+
 from prompt import prompts
+MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 
+INPUT_PATH = "/content/data/src_mt_bt.jsonl"
 
-model_id = "meta-llama/Llama-3.1-8B-Instruct"
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # =========================
+    # LOAD MODEL & TOKENIZER
+    # =========================
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir="")
     model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        cache_dir="",
-        device_map="auto",
-    ).to(device)
+        MODEL_ID,
+        dtype=torch.bfloat16,
+        device_map="auto"   # accelerate gestisce CPU / GPU / disk
+    )
 
+    # padding corretto per LLaMA
+    tokenizer.pad_token = tokenizer.eos_token
+    model.config.pad_token_id = tokenizer.eos_token_id
+
+    # =========================
+    # ARGS
+    # =========================
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output_path", type=str)
-    parser.add_argument("--prompt", type=str)
+    parser.add_argument("--output_path", type=str, required=True)
+    parser.add_argument("--prompt", type=str, required=True)
     args = parser.parse_args()
 
-    processed_sentences = set()
+    # =========================
+    # LOAD DATASET
+    # =========================
+    with open(INPUT_PATH, "r", encoding="utf-8") as f_in, \
+         open(args.output_path, "a", encoding="utf-8") as f_out:
 
-    if os.path.exists(args.output_path):
-        with open(args.output_path, 'r', encoding='utf-8') as output_file:
-            for line in output_file:
-                data = json.loads(line.strip())
-                processed_sentences.add(data["id"])
-
-    # =========================================== Load Dataset ===========================================
-    with open("input.jsonl", 'r') as f_in, open(args.output_path, 'a') as f_out:
         for line in f_in:
             data = json.loads(line)
-            sentence = data.get('en', None)
-            print(sentence)
-            if sentence:
-                prompt_template = prompts[args.prompt]
+            sentence = data.get("src")
 
-                # Default to 'vanilla' prompt format if semantic_roles or atomic_facts are missing/empty
-                if args.prompt == "semantic":
-                    semantic = data.get('semantic_roles', None)
-                    if semantic:
-                        prompt = prompt_template.replace("{{sentence}}", sentence).replace("{{semantic_roles}}", semantic)
-                    else:
-                        prompt = prompt_template.replace("{{sentence}}", sentence)
+            if not sentence:
+                continue
 
-                elif args.prompt == "atomic":
-                    atomics = data.get('atomic_facts', None)
-                    if atomics:
-                        prompt = prompt_template.replace("{{sentence}}", sentence).replace("{{atomic_facts}}", str(atomics))
-                    else:
-                        prompt = prompt_template.replace("{{sentence}}", sentence)
+            print(f"[SRC] {sentence}")
 
-                else:  # Default case (e.g., vanilla)
-                    prompt = prompt_template.replace("{{sentence}}", sentence)
-                
-                print(prompt)
-                messages = [
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": prompt},
-                ]
-                input_ids = tokenizer.apply_chat_template(
-                        messages,
-                        add_generation_prompt=True,
-                        return_tensors="pt",
-                    ).to(device)
-                terminators = [
-                        tokenizer.eos_token_id,
-                        tokenizer.convert_tokens_to_ids("<|eot_id|>")
-                    ]
-                
-                with torch.no_grad():
-                    outputs = model.generate(
-                        input_ids,
-                        max_new_tokens=1024,
-                        eos_token_id=terminators,
+            prompt_template = prompts[args.prompt]
+
+            # -------- prompt construction --------
+            if args.prompt == "semantic":
+                semantic = data.get("semantic_roles")
+                if semantic:
+                    prompt = prompt_template.replace(
+                        "{{sentence}}", sentence
+                    ).replace(
+                        "{{semantic_roles}}", semantic
                     )
-                response = outputs[0][input_ids.shape[-1]:]
-                generated_questions = tokenizer.decode(response, skip_special_tokens=True)
+                else:
+                    prompt = prompt_template.replace("{{sentence}}", sentence)
 
-                if generated_questions:
-                    generated_questions = generated_questions.strip('"\'')
-                
-                print(f"> {generated_questions}")
-                print("\n======================================================\n")
+            elif args.prompt == "atomic":
+                atomics = data.get("atomic_facts")
+                if atomics:
+                    prompt = prompt_template.replace(
+                        "{{sentence}}", sentence
+                    ).replace(
+                        "{{atomic_facts}}", str(atomics)
+                    )
+                else:
+                    prompt = prompt_template.replace("{{sentence}}", sentence)
 
-                data['questions'] = generated_questions
-                f_out.write(json.dumps(data, ensure_ascii=False) + '\n')
-            else:
-                pass
+            else:  # vanilla
+                prompt = prompt_template.replace("{{sentence}}", sentence)
+
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt},
+            ]
+
+            # =========================
+            # CHAT TEMPLATE → TESTO
+            # =========================
+            prompt_text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+
+            # =========================
+            # TOKENIZE → DICT
+            # =========================
+            inputs = tokenizer(
+                prompt_text,
+                return_tensors="pt"
+            ).to(model.device)
+
+            # =========================
+            # GENERATE
+            # =========================
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=32,              # corto e veloce
+                    eos_token_id=tokenizer.eos_token_id
+                )
+
+            # =========================
+            # DECODE
+            # =========================
+            response = outputs[0][inputs["input_ids"].shape[-1]:]
+            questions = tokenizer.decode(
+                response,
+                skip_special_tokens=True
+            ).strip()
+
+            print(f"> {questions}")
+            print("=" * 60)
+
+            data["questions"] = questions
+            f_out.write(json.dumps(data, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":

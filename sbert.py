@@ -5,118 +5,157 @@ import csv
 import torch
 from transformers import AutoTokenizer, AutoModel
 import torch.nn.functional as F
+import os
 
 
+# =========================
+# MEAN POOLING (SBERT)
+# =========================
 def mean_pooling(model_output, attention_mask):
     token_embeddings = model_output[0]
     input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(
+        input_mask_expanded.sum(1), min=1e-9
+    )
 
 
 nltk.download("punkt")
 
+# =========================
+# ARGS
+# =========================
 parser = argparse.ArgumentParser()
-parser.add_argument("--model", type=str)
-parser.add_argument("--output_file", type=str)
+parser.add_argument(
+    "--output_file",
+    type=str,
+    default="results/sbert_results.csv",
+    help="CSV file where SBERT results will be saved",
+)
 args = parser.parse_args()
 
 
-languages = ["es", "fr", "hi", "tl", "zh"]
-pipelines = ["vanilla", "semantic", "atomic"]
-perturbations = ["synonym", "word_order", "spelling", "expansion_noimpact",
-                 "intensifier", "expansion_impact", "omission", "alteration"]
+# ======================================================================
+# ORIGINAL ASKQE (COMMENTED)
+# ======================================================================
+# languages = ["es", "fr", "hi", "tl", "zh"]
+# pipelines = ["vanilla", "semantic", "atomic"]
+# perturbations = [
+#     "synonym", "word_order", "spelling", "expansion_noimpact",
+#     "intensifier", "expansion_impact", "omission", "alteration"
+# ]
 
 
-tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
-model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
+# ======================================================================
+# ADAPTED SETUP — SRC vs BT
+# ======================================================================
 
+pipelines = ["vanilla", "atomic", "semantic"]
+results_dir = "/content/results"
+
+reference_prefix = "src"          # qa_src-*.jsonl
+bt_prefixes = ["mt1", "mt2"]      # qa_bt1-*.jsonl, qa_bt2-*.jsonl
+
+
+# ======================================================================
+# LOAD SBERT MODEL
+# ======================================================================
+tokenizer = AutoTokenizer.from_pretrained(
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+model = AutoModel.from_pretrained(
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+model.eval()
+
+
+# =========================
+# OUTPUT FILE
+# =========================
+os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
 
 with open(args.output_file, mode="w", newline="", encoding="utf-8") as csvfile:
     csv_writer = csv.writer(csvfile)
-    csv_writer.writerow(["language", "perturbation", "pipeline", "cosine_similarity", "num_comparison"])
+    csv_writer.writerow(
+        ["pipeline", "reference", "compared", "avg_sbert_similarity", "num_comparisons"]
+    )
 
-    for language in languages:
-        for pipeline in pipelines:
-            for perturbation in perturbations:
-                print("Language: ", language)
-                print("Pipeline: ", pipeline)
-                print("Perturbation: ", perturbation)
+    # =========================
+    # MAIN LOOP
+    # =========================
+    for pipeline in pipelines:
+        print("=" * 80)
+        print(f"Pipeline: {pipeline}")
 
-                predicted_file = f"../../QA/{args.model}/{language}-{pipeline}-{perturbation}.jsonl"
-                reference_file = f"../../QA/{args.model}/en-{pipeline}.jsonl"
+        reference_file = f"{results_dir}/qa_{reference_prefix}-{pipeline}.jsonl"
+        print(f"Reference file: {reference_file}")
 
-                total_cosine_similarity = 0
-                num_comparisons = 0
+        if not os.path.exists(reference_file):
+            print(f"[SKIP] Missing reference file for pipeline: {pipeline}")
+            continue
 
-                try:
-                    with open(predicted_file, "r", encoding="utf-8") as pred_file, open(reference_file, "r", encoding="utf-8") as ref_file:
-                        for pred_line, ref_line in zip(pred_file, ref_file):
-                            try:
-                                pred_data = json.loads(pred_line)
-                                ref_data = json.loads(ref_line)
+        for bt in bt_prefixes:
+            predicted_file = f"{results_dir}/qa_{bt}-{pipeline}.jsonl"
+            print(f"Compared file: {predicted_file}")
 
-                                predicted_answers = pred_data.get("answers", [])
-                                reference_answers = ref_data.get("answers", [])
+            if not os.path.exists(predicted_file):
+                print(f"[SKIP] Missing BT file for {bt} ({pipeline})")
+                continue
 
-                                if isinstance(predicted_answers, str):
-                                    try:
-                                        predicted_answers = json.loads(predicted_answers)
-                                    except json.JSONDecodeError:
-                                        continue
+            total_cosine_similarity = 0.0
+            num_comparisons = 0
 
-                                if isinstance(reference_answers, str):
-                                    try:
-                                        reference_answers = json.loads(reference_answers)
-                                    except json.JSONDecodeError:
-                                        continue
+            with open(predicted_file, "r", encoding="utf-8") as pred_file, \
+                 open(reference_file, "r", encoding="utf-8") as ref_file:
 
-                                if not isinstance(predicted_answers, list) or not isinstance(reference_answers, list):
-                                    continue
-                                if not predicted_answers or not reference_answers or len(predicted_answers) != len(reference_answers):
-                                    continue
-                                for pred, ref in zip(predicted_answers, reference_answers):
-                                    if not isinstance(pred, str) or not isinstance(ref, str):
-                                        continue
-                                    if pred.strip() == "" or ref.strip() == "":
-                                        continue
+                for pred_line, ref_line in zip(pred_file, ref_file):
+                    try:
+                        pred_data = json.loads(pred_line)
+                        ref_data = json.loads(ref_line)
 
-                                    encoded_pred = tokenizer(pred, padding=True, truncation=True, return_tensors='pt')
-                                    encoded_ref = tokenizer(ref, padding=True, truncation=True, return_tensors='pt')
+                        pred_answer = pred_data.get("answers", "").strip()
+                        ref_answer = ref_data.get("answers", "").strip()
 
-                                    with torch.no_grad():
-                                        pred_output = model(**encoded_pred)
-                                        ref_output = model(**encoded_ref)
+                        if not pred_answer or not ref_answer:
+                            continue
 
-                                    pred_embed = mean_pooling(pred_output, encoded_pred['attention_mask'])
-                                    pred_embeds = F.normalize(pred_embed, p=2, dim=1)
+                        encoded_pred = tokenizer(
+                            pred_answer, padding=True, truncation=True, return_tensors="pt"
+                        )
+                        encoded_ref = tokenizer(
+                            ref_answer, padding=True, truncation=True, return_tensors="pt"
+                        )
 
-                                    ref_embed = mean_pooling(ref_output, encoded_ref['attention_mask'])
-                                    ref_embeds = F.normalize(ref_embed, p=2, dim=1)
+                        with torch.no_grad():
+                            pred_output = model(**encoded_pred)
+                            ref_output = model(**encoded_ref)
 
-                                    cos_sim = F.cosine_similarity(pred_embeds, ref_embeds, dim=1).mean().item()
-                                    total_cosine_similarity += cos_sim
-                                    num_comparisons += 1
+                        pred_embed = mean_pooling(pred_output, encoded_pred["attention_mask"])
+                        ref_embed = mean_pooling(ref_output, encoded_ref["attention_mask"])
 
-                            except json.JSONDecodeError as e:
-                                print(f"Skipping a corrupted line due to JSONDecodeError: {e}")
-                                continue
+                        pred_embed = F.normalize(pred_embed, p=2, dim=1)
+                        ref_embed = F.normalize(ref_embed, p=2, dim=1)
 
-                except FileNotFoundError as e:
-                    print(f"File not found: {e}")
-                    continue
+                        cos_sim = F.cosine_similarity(pred_embed, ref_embed).item()
 
-                if num_comparisons > 0:
-                    avg_cosine_similarity = total_cosine_similarity / num_comparisons
+                        total_cosine_similarity += cos_sim
+                        num_comparisons += 1
 
-                    print("-" * 80)
-                    print("Average Scores:")
-                    print(f"Num comparisons: {num_comparisons}")
-                    print(f"Cosine Similarity: {avg_cosine_similarity:.3f}")
-                    print("=" * 80)
+                    except json.JSONDecodeError:
+                        continue
 
-                    with open(args.output_file, mode="a", newline="", encoding="utf-8") as csvfile:
-                        csv_writer = csv.writer(csvfile)
-                        csv_writer.writerow([language, perturbation, pipeline, avg_cosine_similarity, num_comparisons])
+            if num_comparisons > 0:
+                avg_cosine_similarity = total_cosine_similarity / num_comparisons
 
-                else:
-                    print("No valid comparisons found in the JSONL files.")
+                print(f"SRC vs {bt}")
+                print(f"Num comparisons: {num_comparisons}")
+                print(f"Average SBERT similarity: {avg_cosine_similarity:.4f}")
+
+                csv_writer.writerow([
+                    pipeline,
+                    reference_prefix,
+                    bt,
+                    avg_cosine_similarity,
+                    num_comparisons
+                ])
+            else:
+                print(f"No valid comparisons for SRC vs {bt} ({pipeline})")
